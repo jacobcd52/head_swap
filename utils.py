@@ -6,6 +6,7 @@ import html as html_escaper
 from contextlib import contextmanager
 from tqdm.notebook import tqdm
 import pandas as pd
+import matplotlib.pyplot as plt
 
 
 def clear_mem():
@@ -25,8 +26,62 @@ def matrix_topk(m, k=10):
     topk_indices = t.stack((topk_batch_indices, topk_seq_indices), dim=1)
     return topk_vals, topk_indices
 
+
 @contextmanager
-def swap_head(model_base, model_hs, model_chat, layer, head, verbose=False, ablate=False):
+def swap_head_pair(model_base, model_hs, model_chat, layer, head,  ablate=False):
+    '''
+    In Q and O we swap (layer, 2*head) and (layer, 2*head+1) from the chat model with their base counterparts.
+    In K and V we swap (layer, head) from the chat model with its base counterpart.
+    '''
+    # Store the original weights
+    original_W_Q_0 = model_hs.blocks[layer].attn.W_Q.data[2*head].clone()
+    original_W_Q_1 = model_hs.blocks[layer].attn.W_Q.data[2*head+1].clone()
+    original_W_O_0 = model_hs.blocks[layer].attn.W_O.data[2*head].clone()
+    original_W_O_1 = model_hs.blocks[layer].attn.W_O.data[2*head+1].clone()
+    
+    original_W_K = model_hs.blocks[layer].attn._W_K.data[head].clone()
+    original_W_V = model_hs.blocks[layer].attn._W_V.data[head].clone()
+
+    try:
+        # Swap in weights from the base model, or zeros if ablate is set to True
+        if ablate:
+            # Ablate the pair of heads
+            model_hs.blocks[layer].attn.W_O.data[2*head] = t.zeros_like(model_base.blocks[layer].attn.W_O.data[2*head])
+            model_hs.blocks[layer].attn.W_O.data[2*head+1] = t.zeros_like(model_base.blocks[layer].attn.W_O.data[2*head+1])
+        else:
+            # For Q and O we swap the pair of heads
+            model_hs.blocks[layer].attn.W_Q.data[2*head] = model_base.blocks[layer].attn.W_Q.data[2*head].clone().cuda() 
+            model_hs.blocks[layer].attn.W_Q.data[2*head+1] = model_base.blocks[layer].attn.W_Q.data[2*head+1].clone().cuda()
+            model_hs.blocks[layer].attn.W_O.data[2*head] = model_base.blocks[layer].attn.W_O.data[2*head].clone().cuda()
+            model_hs.blocks[layer].attn.W_O.data[2*head+1] = model_base.blocks[layer].attn.W_O.data[2*head+1].clone().cuda()
+
+            # For K and V we swap single head
+            model_hs.blocks[layer].attn._W_K.data[head] = model_base.blocks[layer].attn._W_K.data[head].clone().cuda()
+            model_hs.blocks[layer].attn._W_V.data[head] = model_base.blocks[layer].attn._W_V.data[head].clone().cuda()
+
+        # Make sure no other layers have a nonzero W_Q diff
+        for l in range(model_chat.cfg.n_layers):
+            diff_norm = (model_chat.W_Q[l] - model_hs.W_Q[l]).norm()
+            if l != layer:
+                assert diff_norm < 1e-5, f"Swapping layer {layer}, but layer {l} has nonzero W_Q diff: {diff_norm}"
+            
+        # Enter the context with swapped weights
+        yield
+        
+    finally:
+        # Restore the original weights
+        model_hs.blocks[layer].attn.W_Q.data[2*head] = original_W_Q_0.clone()
+        model_hs.blocks[layer].attn.W_Q.data[2*head+1] = original_W_Q_1.clone()
+        model_hs.blocks[layer].attn.W_O.data[2*head] = original_W_O_0.clone()
+        model_hs.blocks[layer].attn.W_O.data[2*head+1] = original_W_O_1.clone()
+
+        model_hs.blocks[layer].attn._W_K.data[head] = original_W_K.clone()
+        model_hs.blocks[layer].attn._W_V.data[head] = original_W_V.clone()
+        clear_mem()
+
+
+@contextmanager
+def swap_head(model_base, model_hs, model_chat, layer, head, verbose=False, ablate=False, swap_kv=False):
     # Store the original weights
     original_W_Q = model_hs.blocks[layer].attn.W_Q.data[head].clone()
     original_W_K = model_hs.blocks[layer].attn._W_K.data[head // 2].clone() # head indexing is due to GQA fuckery
@@ -39,9 +94,10 @@ def swap_head(model_base, model_hs, model_chat, layer, head, verbose=False, abla
             model_hs.blocks[layer].attn.W_O.data[head] = t.zeros_like(model_base.blocks[layer].attn.W_O.data[head])
         else:
             model_hs.blocks[layer].attn.W_Q.data[head] = model_base.blocks[layer].attn.W_Q.data[head].clone().cuda() 
-            model_hs.blocks[layer].attn._W_K.data[head // 2] = model_base.blocks[layer].attn._W_K.data[head // 2].clone().cuda()
-            model_hs.blocks[layer].attn._W_V.data[head // 2] = model_base.blocks[layer].attn._W_V.data[head // 2].clone().cuda()
             model_hs.blocks[layer].attn.W_O.data[head] = model_base.blocks[layer].attn.W_O.data[head].clone().cuda()
+            if swap_kv:
+                model_hs.blocks[layer].attn._W_K.data[head // 2] = model_base.blocks[layer].attn._W_K.data[head // 2].clone().cuda()
+                model_hs.blocks[layer].attn._W_V.data[head // 2] = model_base.blocks[layer].attn._W_V.data[head // 2].clone().cuda()
         
         if verbose:
             print(f"Swapped layer {layer} head {head}")
@@ -60,12 +116,14 @@ def swap_head(model_base, model_hs, model_chat, layer, head, verbose=False, abla
         model_hs.blocks[layer].attn.W_O.data[head] = original_W_O.clone()
         clear_mem()
 
-def get_kl(model_base, model_hs, model_chat, toks, layer, head, batch_size=4):
+
+
+def get_kl(model_base, model_hs, model_chat, toks, layer, head, batch_size=4, verbose=True):
     num_batches = toks.shape[0] // batch_size
     kl_hs_chat = []
     kl_ablated_chat = []
 
-    for i in tqdm(range(num_batches)):
+    for i in tqdm(range(num_batches), disable=not verbose):
         batch_toks = toks[i*batch_size : (i+1)*batch_size]
 
         logits_chat = model_chat(batch_toks)
@@ -84,6 +142,18 @@ def get_kl(model_base, model_hs, model_chat, toks, layer, head, batch_size=4):
 
     # Concatenate KLs from all batches, and return
     return t.cat(kl_hs_chat), t.cat(kl_ablated_chat)
+
+
+def kl_histogram(kl, layer, head, save_dir: str):
+    plt.figure(figsize=(10, 6))
+    plt.hist(kl.flatten().float().cpu().numpy(), bins=50)
+    plt.yscale('log')
+    plt.title(f"KL distribution: L{layer} H{head}")
+    plt.xlabel("KL")
+    plt.ylabel("count")
+    plt.savefig(save_dir)
+    plt.close()
+
 
 def highlight_kl(model_base, model_hs, model_chat, toks_context, layer, head, ablate=False, cscale=0.05, n_top_toks=3):
     if toks_context.dim() == 1:
@@ -195,9 +265,9 @@ def highlight_kl(model_base, model_hs, model_chat, toks_context, layer, head, ab
             # Define styling function
             def highlight_log_diff(val):
                 if val > 0: # Positive contribution to KL (more likely in B)
-                    color = 'lightgreen'
+                    color = 'forestgreen'
                 elif val < 0: # Negative contribution to KL (less likely in B)
-                    color = 'lightcoral'
+                    color = 'indianred'
                 else:
                     color = '' # No highlight for zero
                 return f'background-color: {color}'
@@ -210,9 +280,9 @@ def highlight_kl(model_base, model_hs, model_chat, toks_context, layer, head, ab
                 styles = [''] * len(row) # Default no style
                 log_diff = row['log_diff']
                 if log_diff > 0:
-                    styles[row.index.get_loc('Token')] = 'background-color: lightgreen'
+                    styles[row.index.get_loc('Token')] = 'background-color: forestgreen'
                 elif log_diff < 0:
-                    styles[row.index.get_loc('Token')] = 'background-color: lightcoral'
+                    styles[row.index.get_loc('Token')] = 'background-color: indianred'
                 return styles
 
             styled_df = df.style.apply(style_row, axis=1)\

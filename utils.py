@@ -29,20 +29,19 @@ def matrix_topk(m, k=10):
 def swap_head(model_base, model_hs, model_chat, layer, head, verbose=False, ablate=False):
     # Store the original weights
     original_W_Q = model_hs.blocks[layer].attn.W_Q.data[head].clone()
-    original_W_K = model_hs.blocks[layer].attn.W_K.data[head].clone()
-    original_W_V = model_hs.blocks[layer].attn.W_V.data[head].clone()
+    original_W_K = model_hs.blocks[layer].attn._W_K.data[head // 2].clone() # head indexing is due to GQA fuckery
+    original_W_V = model_hs.blocks[layer].attn._W_V.data[head // 2].clone() # head indexing is due to GQA fuckery
     original_W_O = model_hs.blocks[layer].attn.W_O.data[head].clone()
     try:
         # Swap in weights from the base model, or zeros if ablate is set to True
         if ablate:
-            print("ablate")
-            model_hs.blocks[layer].attn.W_V.data[head] = t.zeros_like(model_base.blocks[layer].attn.W_V.data[head])
+            # model_hs.blocks[layer].attn._W_V.data[head // 2] = t.zeros_like(model_base.blocks[layer].attn._W_V.data[head // 2])
             model_hs.blocks[layer].attn.W_O.data[head] = t.zeros_like(model_base.blocks[layer].attn.W_O.data[head])
         else:
-            model_hs.blocks[layer].attn.W_Q.data[head] = model_base.blocks[layer].attn.W_Q.data[head].clone().cuda() + 1000
-            model_hs.blocks[layer].attn.W_K.data[head] = model_base.blocks[layer].attn.W_K.data[head].clone().cuda() + 100
-            model_hs.blocks[layer].attn.W_V.data[head] = model_base.blocks[layer].attn.W_V.data[head].clone().cuda() + 100
-            model_hs.blocks[layer].attn.W_O.data[head] = model_base.blocks[layer].attn.W_O.data[head].clone().cuda() + 1000
+            model_hs.blocks[layer].attn.W_Q.data[head] = model_base.blocks[layer].attn.W_Q.data[head].clone().cuda() 
+            model_hs.blocks[layer].attn._W_K.data[head // 2] = model_base.blocks[layer].attn._W_K.data[head // 2].clone().cuda()
+            model_hs.blocks[layer].attn._W_V.data[head // 2] = model_base.blocks[layer].attn._W_V.data[head // 2].clone().cuda()
+            model_hs.blocks[layer].attn.W_O.data[head] = model_base.blocks[layer].attn.W_O.data[head].clone().cuda()
         
         if verbose:
             print(f"Swapped layer {layer} head {head}")
@@ -56,8 +55,8 @@ def swap_head(model_base, model_hs, model_chat, layer, head, verbose=False, abla
     finally:
         # Restore the original weights
         model_hs.blocks[layer].attn.W_Q.data[head] = original_W_Q.clone()
-        model_hs.blocks[layer].attn.W_K.data[head] = original_W_K.clone()
-        model_hs.blocks[layer].attn.W_V.data[head] = original_W_V.clone()
+        model_hs.blocks[layer].attn._W_K.data[head // 2] = original_W_K.clone()
+        model_hs.blocks[layer].attn._W_V.data[head // 2] = original_W_V.clone()
         model_hs.blocks[layer].attn.W_O.data[head] = original_W_O.clone()
         clear_mem()
 

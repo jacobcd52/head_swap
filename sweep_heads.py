@@ -33,8 +33,11 @@ toks = model_base.to_tokens(data, prepend_bos=False)[:, :MAX_SEQ_LEN]
 toks = t.stack([seq for seq in toks if t.all(seq != 0)])[:NUM_LINES]
 
 
-for layer in range(model_base.cfg.n_layers):
+for layer in range(20, model_base.cfg.n_layers):
     for head in range(model_base.cfg.n_heads):
+
+        if (layer, head) in [(20, 0), (20, 1), (20, 2), (20, 3), (20, 4), (20, 5), (20, 6)]:
+            continue
 
         print(f"Layer {layer}, head {head}")
 
